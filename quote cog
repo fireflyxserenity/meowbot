@@ -1,0 +1,555 @@
+import discord
+from discord.ext import commands
+from discord import app_commands
+import io
+import aiohttp
+from PIL import Image, ImageDraw, ImageFont
+import textwrap
+from multi_server_models import get_server_settings
+
+class QuoteCog(commands.Cog):
+    """Quote creation and management commands."""
+    
+    def __init__(self, bot):
+        self.bot = bot
+
+    async def cog_load(self):
+        """Called when the cog is loaded."""
+        print("Quote Cog loaded")
+
+    async def send_quote_with_archival(self, quote_image, embed, send_channel, guild, created_by_user, interaction=None):
+        """Send quote to current channel and optionally archive to quote channel."""
+        
+        try:
+            # Send to the current channel first
+            quote_image.seek(0)  # Reset file position
+            file = discord.File(quote_image, filename="quote.png")
+            
+            if interaction:
+                # Use interaction followup for slash commands
+                sent_message = await interaction.followup.send(embed=embed, file=file)
+            else:
+                # Use regular channel send for other methods
+                sent_message = await send_channel.send(embed=embed, file=file)
+            
+            # Check if we should also archive to quote channel
+            settings = get_server_settings(guild.id)
+            if settings.quote_channel_id:
+                archive_channel = guild.get_channel(settings.quote_channel_id)
+                
+                # Only archive if it's a different channel to avoid duplicates
+                if archive_channel and archive_channel.id != send_channel.id:
+                    try:
+                        # Create a copy of the embed for archival
+                        archive_embed = discord.Embed(
+                            title="📸 Quote Archived",
+                            color=discord.Color.gold(),
+                            timestamp=embed.timestamp
+                        )
+                        archive_embed.set_footer(
+                            text=f"Quote created by {created_by_user.display_name} in #{send_channel.name}",
+                            icon_url=created_by_user.display_avatar.url
+                        )
+                        
+                        # Send copy to archive channel
+                        quote_image.seek(0)  # Reset file position again
+                        archive_file = discord.File(quote_image, filename="quote.png")
+                        await archive_channel.send(embed=archive_embed, file=archive_file)
+                        
+                        print(f"✅ Quote archived to {archive_channel.name} for guild {guild.id}")
+                        
+                    except Exception as archive_error:
+                        print(f"⚠️ Failed to archive quote to {archive_channel.name}: {archive_error}")
+                        # Don't fail the whole operation if archival fails
+            
+            return sent_message
+            
+        except Exception as e:
+            print(f"❌ Error sending quote: {e}")
+            raise e
+
+    @commands.Cog.listener()
+    async def on_message(self, message):
+        """Listen for mentions in replies to create quotes (like Make It a Quote bot)."""
+        
+        # Ignore if not in a guild, or if author is a bot
+        if not message.guild or message.author.bot:
+            return
+        
+        # Check if the bot is mentioned in the message
+        if not self.bot.user.mentioned_in(message):
+            return
+        
+        # Check if this is a reply to another message
+        if message.reference is not None:
+            try:
+                # Get the message being replied to
+                quote_msg = message.reference.resolved
+                if quote_msg is discord.DeletedReferencedMessage or quote_msg is None:
+                    return
+                
+                # Check if there's actual content to quote
+                content = quote_msg.clean_content
+                if content == "":
+                    return
+                
+                # Delete the mention message to keep chat clean
+                try:
+                    await message.delete()
+                except:
+                    pass
+                
+                # Start typing indicator
+                async with message.channel.typing():
+                    # Generate the quote image
+                    quote_image = await self.create_quote_image(quote_msg)
+                    
+                    # Create embed for the quote
+                    embed = discord.Embed(
+                        title="📸 Quote Created",
+                        color=discord.Color.gold(),
+                        timestamp=quote_msg.created_at
+                    )
+                    embed.set_footer(
+                        text=f"Quote created by {message.author.display_name}",
+                        icon_url=message.author.display_avatar.url
+                    )
+                    
+                    # Send quote with archival
+                    await self.send_quote_with_archival(
+                        quote_image, embed, message.channel, message.guild, message.author
+                    )
+                    
+            except Exception as e:
+                print(f"Error creating quote from mention: {e}")
+                await message.channel.send(f"❌ Error creating quote: {str(e)}", delete_after=10)
+
+    @app_commands.command(name="quote", description="📸 Create a quote image from a message")
+    @app_commands.describe(
+        message_id="Message ID to quote (right-click message → Copy Message ID)",
+        message_link="Message link to quote (right-click message → Copy Message Link)"
+    )
+    async def quote(self, interaction: discord.Interaction, message_id: str = None, message_link: str = None):
+        """Create a beautiful quote image from a message."""
+        
+        target_message = None
+        
+        # Try to get message from link first (easier for users)
+        if message_link:
+            try:
+                # Parse Discord message link: https://discord.com/channels/guild_id/channel_id/message_id
+                parts = message_link.split('/')
+                if len(parts) >= 3:
+                    msg_id = parts[-1]  # Last part is message ID
+                    channel_id = parts[-2]  # Second to last is channel ID
+                    
+                    # Get the channel and message
+                    channel = interaction.guild.get_channel(int(channel_id))
+                    if channel:
+                        target_message = await channel.fetch_message(int(msg_id))
+                    else:
+                        await interaction.response.send_message("❌ Cannot access that channel!", ephemeral=True)
+                        return
+                else:
+                    await interaction.response.send_message("❌ Invalid message link format!", ephemeral=True)
+                    return
+            except (ValueError, discord.NotFound) as e:
+                await interaction.response.send_message("❌ Could not find message from that link!", ephemeral=True)
+                return
+            except Exception as e:
+                await interaction.response.send_message(f"❌ Error processing message link: {e}", ephemeral=True)
+                return
+        
+        # If no link, try message ID
+        elif message_id:
+            try:
+                target_message = await interaction.channel.fetch_message(int(message_id))
+            except ValueError:
+                await interaction.response.send_message("❌ Invalid message ID format!", ephemeral=True)
+                return
+            except discord.NotFound:
+                await interaction.response.send_message("❌ Message not found in this channel!", ephemeral=True)
+                return
+            except Exception as e:
+                await interaction.response.send_message(f"❌ Error fetching message: {e}", ephemeral=True)
+                return
+        
+        # If still no target message, show instructions
+        if not target_message:
+            embed = discord.Embed(
+                title="📸 Quote Creator",
+                description="To create a quote image:",
+                color=discord.Color.blue()
+            )
+            embed.add_field(
+                name="✨ Easiest Method (Recommended)",
+                value=(
+                    "**Reply to any message** and **@mention the bot**\n"
+                    "Works exactly like the Make It a Quote bot!"
+                ),
+                inline=False
+            )
+            embed.add_field(
+                name="🖱️ Super Easy: Right-click Method",
+                value=(
+                    "**Right-click any message** → **Apps** → **Quote**\n"
+                    "Perfect for any message, any channel!"
+                ),
+                inline=False
+            )
+            embed.add_field(
+                name="⚡ Quick: Regular Command",
+                value=(
+                    "**Reply to any message** and type `!quote` or `!q`\n"
+                    "Fast and clean!"
+                ),
+                inline=False
+            )
+            embed.add_field(
+                name="💻 Slash Command Options",
+                value=(
+                    "**With Message Link:** `/quote message_link:paste_link_here`\n"
+                    "**With Message ID:** `/quote message_id:123456789`\n"
+                    "*(Right-click any message → Copy Message Link/ID)*"
+                ),
+                inline=False
+            )
+            embed.set_footer(text="💡 Message links work across channels and servers!")
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+        
+        # At this point we have target_message, proceed with quote creation
+        await interaction.response.defer()
+        
+        try:
+            # Generate the quote image
+            quote_image = await self.create_quote_image(target_message)
+            
+            # Create embed for the quote
+            embed = discord.Embed(
+                title="📸 Quote Created",
+                color=discord.Color.gold(),
+                timestamp=target_message.created_at
+            )
+            embed.set_footer(
+                text=f"Quote created by {interaction.user.display_name}",
+                icon_url=interaction.user.display_avatar.url
+            )
+            
+            # Send quote with archival
+            await self.send_quote_with_archival(
+                quote_image, embed, interaction.channel, interaction.guild, interaction.user, interaction
+            )
+            
+        except Exception as e:
+            print(f"Error creating quote: {e}")
+            embed = discord.Embed(
+                title="❌ Quote Creation Failed",
+                description=f"An error occurred while creating the quote: {str(e)}",
+                color=discord.Color.red()
+            )
+            await interaction.followup.send(embed=embed, ephemeral=True)
+
+    async def create_quote_image(self, message):
+        """Create a beautiful quote image from a message."""
+        
+        # Get user info
+        author = message.author
+        username = author.display_name
+        handle = f"@{author.name}"
+        
+        # Get message content - use original content to preserve emojis properly
+        raw_content = message.content.strip() if message.content else ""
+        
+        # Clean the username to handle special characters properly
+        if username:
+            # Only remove truly problematic characters that cause rendering issues
+            import re
+            # Remove only control characters and zero-width chars, keep decorative Unicode
+            username = re.sub(r'[\u0000-\u001F\u007F-\u009F\u200B-\u200D\u2060-\u206F\uFEFF]', '', username)
+            # Remove replacement characters but keep decorative symbols
+            username = username.replace('�', '').strip()
+            
+            # If username becomes empty after cleaning, use the regular name
+            if not username or len(username.strip()) < 1:
+                username = author.name
+                # Apply same gentle cleaning to fallback
+                username = re.sub(r'[\u0000-\u001F\u007F-\u009F\u200B-\u200D\u2060-\u206F\uFEFF]', '', username)
+                username = username.replace('�', '').strip()
+        else:
+            username = author.name
+        
+        # If no text content, check for attachments or embeds
+        if not raw_content:
+            if message.attachments:
+                raw_content = "*(Image or attachment)*"
+            elif message.embeds:
+                raw_content = "*(Embed content)*"
+            else:
+                raw_content = "*(No text content)*"
+        
+        # Limit content length
+        if len(raw_content) > 280:
+            raw_content = raw_content[:277] + "..."
+        
+        content = raw_content
+        
+        # Simplified sizing like Make It a Quote - consistent and clean
+        avatar_size = 80  # Smaller, cleaner avatar
+        username_font_size = 24  # Consistent username size
+        handle_font_size = 16   # Smaller handle
+        content_font_size = 20  # Readable content
+        width = 600             # Standard width
+        padding = 40            # Clean padding
+        
+        # Clean color palette like Make It a Quote
+        bg_color = (36, 36, 36)        # Simple dark background
+        text_color = (255, 255, 255)   # Pure white text
+        username_color = (255, 255, 255)  # White username
+        handle_color = (150, 150, 150)    # Gray handle
+        shadow_color = (0, 0, 0)          # Black shadow
+        border_color = (100, 100, 100)    # Simple gray border
+        
+        # Download avatar with dynamic sizing
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(str(author.display_avatar.url)) as resp:
+                    avatar_data = await resp.read()
+            
+            avatar = Image.open(io.BytesIO(avatar_data))
+            avatar = avatar.convert('RGBA')
+            avatar = avatar.resize((avatar_size, avatar_size), Image.Resampling.LANCZOS)
+            
+            # Create perfect circular mask with anti-aliasing
+            mask = Image.new('L', (avatar_size, avatar_size), 0)
+            draw_mask = ImageDraw.Draw(mask)
+            draw_mask.ellipse((1, 1, avatar_size-1, avatar_size-1), fill=255)
+            
+            # Apply mask for perfect circle with smooth edges
+            circular_avatar = Image.new('RGBA', (avatar_size, avatar_size), (0, 0, 0, 0))
+            circular_avatar.paste(avatar, (0, 0))
+            circular_avatar.putalpha(mask)
+            
+            # Simple clean avatar - no glow effects
+            avatar = circular_avatar
+            
+        except Exception as e:
+            print(f"Avatar processing error: {e}")
+            # Simple fallback avatar
+            avatar = Image.new('RGBA', (avatar_size, avatar_size), (100, 100, 100, 255))
+            draw_avatar = ImageDraw.Draw(avatar)
+            # Simple circle
+            draw_avatar.ellipse((2, 2, avatar_size-2, avatar_size-2), fill=(150, 150, 150))
+            draw_avatar.ellipse((2, 2, avatar_size-2, avatar_size-2), outline=(200, 200, 200), width=2)
+        
+        # Load fonts - prioritize simple, clean fonts like Make It a Quote
+        try:
+            # Use system fonts that handle text properly - no special emoji fonts
+            username_font = ImageFont.truetype("arial.ttf", username_font_size)
+            handle_font = ImageFont.truetype("arial.ttf", handle_font_size)
+            content_font = ImageFont.truetype("arial.ttf", content_font_size)
+            print("📝 Using Arial font for clean text rendering")
+        except:
+            try:
+                # Fallback to Calibri
+                username_font = ImageFont.truetype("calibri.ttf", username_font_size)
+                handle_font = ImageFont.truetype("calibri.ttf", handle_font_size)
+                content_font = ImageFont.truetype("calibri.ttf", content_font_size)
+                print("� Using Calibri font")
+            except:
+                try:
+                    # Fallback to Segoe UI (without emoji)
+                    username_font = ImageFont.truetype("segoeui.ttf", username_font_size)
+                    handle_font = ImageFont.truetype("segoeui.ttf", handle_font_size)
+                    content_font = ImageFont.truetype("segoeui.ttf", content_font_size)
+                    print("� Using Segoe UI font")
+                except:
+                    # Final fallback
+                    username_font = ImageFont.load_default()
+                    handle_font = ImageFont.load_default()
+                    content_font = ImageFont.load_default()
+                    print("⚠️ Using default font")
+        
+        # Better text wrapping calculation with Unicode support
+        max_text_width = width - avatar_size - (padding * 3)
+        
+        # Create a temporary draw object for text measurement
+        temp_img = Image.new('RGB', (100, 100), (0, 0, 0))
+        temp_draw = ImageDraw.Draw(temp_img)
+        
+        # Use a more conservative character estimation for better wrapping
+        test_text = "M" * 10  # Use a wide character for testing
+        try:
+            test_width = temp_draw.textlength(test_text, font=content_font)
+            chars_per_line = max(15, int((max_text_width * 10) / test_width))
+        except:
+            # Fallback calculation
+            chars_per_line = max(15, max_text_width // (content_font_size // 2))
+        
+        # Ensure we don't break words too aggressively
+        wrapped_text = textwrap.fill(content, width=chars_per_line, break_long_words=False, break_on_hyphens=False)
+        text_lines = wrapped_text.split('\n')
+        line_height = content_font_size + 10  # More generous line spacing
+        text_height = len(text_lines) * line_height
+        
+        # Calculate height more like Make It a Quote
+        min_height = avatar_size + (padding * 2)
+        text_section_height = username_font_size + handle_font_size + text_height + 60
+        total_height = max(min_height, text_section_height + padding)
+        
+        # Position variables for clean layout
+        avatar_x = padding
+        avatar_y = padding
+        
+        # Create simple clean image like Make It a Quote
+        img = Image.new('RGB', (width, total_height), bg_color)
+        draw = ImageDraw.Draw(img)
+        
+        # Position avatar with premium styling
+        img.paste(avatar, (avatar_x, avatar_y), avatar)
+        
+        # Position text with clean, simple spacing
+        text_start_x = avatar_x + avatar_size + 20  # Simple spacing
+        username_y = avatar_y
+        handle_y = username_y + username_font_size + 5
+        content_y = handle_y + handle_font_size + 15
+        
+        # Draw username with clean styling (no embedded_color)
+        # Add shadow for depth
+        draw.text((text_start_x + 1, username_y + 1), username, fill=shadow_color, font=username_font)
+        draw.text((text_start_x, username_y), username, fill=username_color, font=username_font)
+        
+        # Draw handle with clean appearance
+        draw.text((text_start_x, handle_y), handle, fill=handle_color, font=handle_font)
+        
+        # Draw content with clean text rendering
+        y_offset = content_y
+        for line in text_lines:
+            # Add shadow for readability
+            draw.text((text_start_x + 1, y_offset + 1), line, fill=shadow_color, font=content_font)
+            draw.text((text_start_x, y_offset), line, fill=text_color, font=content_font)
+            y_offset += line_height
+        
+        # Simple clean border like Make It a Quote
+        draw.rectangle([(0, 0), (width-1, total_height-1)], outline=border_color, width=1)
+        
+        # Convert to bytes
+        img_bytes = io.BytesIO()
+        img.save(img_bytes, format='PNG', quality=95)
+        img_bytes.seek(0)
+        
+        return img_bytes
+
+    @commands.command(name="quote", aliases=["q"])
+    async def quote_message_command(self, ctx, *, args=None):
+        """Create a quote image by replying to a message and using !quote or !q"""
+        
+        # Check if this is a reply to a message
+        if ctx.message.reference and ctx.message.reference.message_id:
+            try:
+                # Get the message being replied to
+                target_message = await ctx.channel.fetch_message(ctx.message.reference.message_id)
+                
+                # Delete the command message to keep chat clean
+                try:
+                    await ctx.message.delete()
+                except:
+                    pass
+                
+                # Generate the quote image
+                quote_image = await self.create_quote_image(target_message)
+                
+                # Create embed for the quote
+                embed = discord.Embed(
+                    title="📸 Quote Created",
+                    color=discord.Color.gold(),
+                    timestamp=target_message.created_at
+                )
+                embed.set_footer(
+                    text=f"Quote created by {ctx.author.display_name}",
+                    icon_url=ctx.author.display_avatar.url
+                )
+                
+                # Send quote with archival
+                await self.send_quote_with_archival(
+                    quote_image, embed, ctx.channel, ctx.guild, ctx.author
+                )
+                
+            except discord.NotFound:
+                await ctx.send("❌ Could not find the message you replied to!", delete_after=5)
+            except Exception as e:
+                print(f"Error creating quote: {e}")
+                await ctx.send(f"❌ Error creating quote: {str(e)}", delete_after=10)
+        else:
+            # Not a reply, show instructions
+            embed = discord.Embed(
+                title="📸 Quote Creator",
+                description="To create a quote image:",
+                color=discord.Color.blue()
+            )
+            embed.add_field(
+                name="✨ Easy Methods",
+                value=(
+                    "• **Reply to any message** and **@mention the bot** (like Make It a Quote!)\n"
+                    "• **Reply to any message** and type `!quote` or `!q`\n"
+                    "• **Right-click any message** → **Apps** → **Quote**\n"
+                    "• **Use `/quote message_id:123456`** with message ID"
+                ),
+                inline=False
+            )
+            embed.set_footer(text="💡 All methods work great!")
+            await ctx.send(embed=embed, delete_after=15)
+            
+            # Delete the command message after a delay
+            try:
+                await ctx.message.delete(delay=15)
+            except:
+                pass
+
+# Context menu for quoting messages (defined outside the class)
+@app_commands.context_menu(name="Quote")
+async def quote_context_menu(interaction: discord.Interaction, message: discord.Message):
+    """Create a quote image from a message using the context menu (right-click)."""
+    
+    # Get the quote cog to use its methods
+    quote_cog = interaction.client.get_cog('QuoteCog')
+    if not quote_cog:
+        await interaction.response.send_message("❌ Quote system not available!", ephemeral=True)
+        return
+    
+    # Defer the response since image generation takes time
+    await interaction.response.defer()
+    
+    try:
+        # Generate the quote image
+        quote_image = await quote_cog.create_quote_image(message)
+        
+        # Create embed for the quote
+        embed = discord.Embed(
+            title="📸 Quote Created",
+            color=discord.Color.gold(),
+            timestamp=message.created_at
+        )
+        embed.set_footer(
+            text=f"Quote created by {interaction.user.display_name}",
+            icon_url=interaction.user.display_avatar.url
+        )
+        
+        # Send quote with archival
+        await quote_cog.send_quote_with_archival(
+            quote_image, embed, interaction.channel, interaction.guild, interaction.user, interaction
+        )
+        
+    except Exception as e:
+        print(f"❌ Error creating quote: {e}")
+        error_embed = discord.Embed(
+            title="❌ Quote Creation Failed",
+            description=f"Sorry, I couldn't create a quote from that message.\n\nError: {str(e)}",
+            color=discord.Color.red()
+        )
+        await interaction.followup.send(embed=error_embed)
+
+async def setup(bot):
+    await bot.add_cog(QuoteCog(bot))
+    # Add the context menu command
+    bot.tree.add_command(quote_context_menu)
