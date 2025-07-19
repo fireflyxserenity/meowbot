@@ -5,6 +5,7 @@ import io
 import aiohttp
 from PIL import Image, ImageDraw, ImageFont
 import textwrap
+import re
 from multi_server_models import get_server_settings
 
 class QuoteCog(commands.Cog):
@@ -251,35 +252,40 @@ class QuoteCog(commands.Cog):
             await interaction.followup.send(embed=embed, ephemeral=True)
 
     async def create_quote_image(self, message):
-        """Create a beautiful quote image from a message."""
+        """Create a beautiful quote image from a message with proper Unicode and gradient support."""
         
         # Get user info
         author = message.author
         username = author.display_name
         handle = f"@{author.name}"
         
-        # Get message content - use original content to preserve emojis properly
+        # Get message content - process Discord emojis
         raw_content = message.content.strip() if message.content else ""
         
-        # Clean the username to handle special characters properly
+        # Process Discord custom emojis
+        emoji_pattern = r'<(a?):([^:]+):(\d+)>'
+        def replace_emoji(match):
+            is_animated = match.group(1) == 'a'
+            emoji_name = match.group(2)
+            print(f"🎭 Found Discord emoji: {emoji_name} (animated: {is_animated})")
+            return f":{emoji_name}:"
+        
+        raw_content = re.sub(emoji_pattern, replace_emoji, raw_content)
+        
+        # Clean username with better Unicode handling
         if username:
-            # Only remove truly problematic characters that cause rendering issues
-            import re
-            # Remove only control characters and zero-width chars, keep decorative Unicode
+            # Keep most Unicode characters but remove problematic ones
             username = re.sub(r'[\u0000-\u001F\u007F-\u009F\u200B-\u200D\u2060-\u206F\uFEFF]', '', username)
-            # Remove replacement characters but keep decorative symbols
             username = username.replace('�', '').strip()
             
-            # If username becomes empty after cleaning, use the regular name
             if not username or len(username.strip()) < 1:
                 username = author.name
-                # Apply same gentle cleaning to fallback
                 username = re.sub(r'[\u0000-\u001F\u007F-\u009F\u200B-\u200D\u2060-\u206F\uFEFF]', '', username)
                 username = username.replace('�', '').strip()
         else:
             username = author.name
         
-        # If no text content, check for attachments or embeds
+        # Handle empty content
         if not raw_content:
             if message.attachments:
                 raw_content = "*(Image or attachment)*"
@@ -294,23 +300,80 @@ class QuoteCog(commands.Cog):
         
         content = raw_content
         
-        # Simplified sizing like Make It a Quote - consistent and clean
-        avatar_size = 80  # Smaller, cleaner avatar
-        username_font_size = 24  # Consistent username size
-        handle_font_size = 16   # Smaller handle
-        content_font_size = 20  # Readable content
-        width = 600             # Standard width
-        padding = 40            # Clean padding
+        # Clean encoding issues
+        try:
+            content = content.encode('utf-8', errors='ignore').decode('utf-8')
+        except:
+            pass
         
-        # Clean color palette like Make It a Quote
-        bg_color = (36, 36, 36)        # Simple dark background
-        text_color = (255, 255, 255)   # Pure white text
-        username_color = (255, 255, 255)  # White username
-        handle_color = (150, 150, 150)    # Gray handle
-        shadow_color = (0, 0, 0)          # Black shadow
-        border_color = (100, 100, 100)    # Simple gray border
+        # Simplified sizing like Make It a Quote
+        username_font_size = 16
+        handle_font_size = 14
+        content_font_size = 20
+        width = 600
+        padding = 40
         
-        # Download avatar with dynamic sizing
+        # Clean color palette
+        bg_color = (0, 0, 0)
+        text_color = (255, 255, 255)
+        username_color = (255, 255, 255)
+        handle_color = (150, 150, 150)
+        shadow_color = (30, 30, 30)  # Slightly gray shadow instead of pure black
+        
+        # Load fonts with better Unicode support
+        def load_fonts():
+            """Load the best available fonts for Unicode support."""
+            font_attempts = [
+                ("C:/Windows/Fonts/segoeui.ttf", "Segoe UI (system path)"),
+                ("segoeui.ttf", "Segoe UI"),
+                ("C:/Windows/Fonts/arial.ttf", "Arial (system path)"),
+                ("arial.ttf", "Arial"),
+                ("C:/Windows/Fonts/calibri.ttf", "Calibri (system path)"),
+                ("calibri.ttf", "Calibri"),
+                ("C:/Windows/Fonts/tahoma.ttf", "Tahoma (system path)"),
+                ("tahoma.ttf", "Tahoma"),
+            ]
+            
+            for font_path, font_name in font_attempts:
+                try:
+                    username_font = ImageFont.truetype(font_path, username_font_size)
+                    handle_font = ImageFont.truetype(font_path, handle_font_size)
+                    content_font = ImageFont.truetype(font_path, content_font_size)
+                    print(f"📝 Successfully loaded {font_name}")
+                    return username_font, handle_font, content_font
+                except:
+                    continue
+            
+            print("⚠️ Using default font - Unicode characters may not display properly")
+            return ImageFont.load_default(), ImageFont.load_default(), ImageFont.load_default()
+        
+        username_font, handle_font, content_font = load_fonts()
+        
+        # Better text wrapping calculation
+        temp_img = Image.new('RGB', (100, 100), (0, 0, 0))
+        temp_draw = ImageDraw.Draw(temp_img)
+        
+        # Calculate max text width (width minus avatar space and padding)
+        max_text_width = width - 200 - padding  # 200px for avatar area + padding
+        
+        # Use actual text measurement for better wrapping
+        test_text = "M" * 10
+        try:
+            test_width = temp_draw.textlength(test_text, font=content_font)
+            chars_per_line = max(15, int((max_text_width * 10) / test_width))
+        except:
+            chars_per_line = max(15, max_text_width // (content_font_size // 2))
+        
+        wrapped_text = textwrap.fill(content, width=chars_per_line, break_long_words=False, break_on_hyphens=False)
+        text_lines = wrapped_text.split('\n')
+        line_height = content_font_size + 10
+        text_height = len(text_lines) * line_height
+        
+        # Calculate total height
+        text_section_height = text_height + username_font_size + handle_font_size + 60
+        total_height = max(200, text_section_height + (padding * 2))
+        
+        # Download and process avatar
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(str(author.display_avatar.url)) as resp:
@@ -318,120 +381,82 @@ class QuoteCog(commands.Cog):
             
             avatar = Image.open(io.BytesIO(avatar_data))
             avatar = avatar.convert('RGBA')
-            avatar = avatar.resize((avatar_size, avatar_size), Image.Resampling.LANCZOS)
+            avatar = avatar.resize((total_height, total_height), Image.Resampling.LANCZOS)
             
-            # Create perfect circular mask with anti-aliasing
-            mask = Image.new('L', (avatar_size, avatar_size), 0)
+            # Create rounded corner mask
+            mask = Image.new('L', (total_height, total_height), 0)
             draw_mask = ImageDraw.Draw(mask)
-            draw_mask.ellipse((1, 1, avatar_size-1, avatar_size-1), fill=255)
+            corner_radius = 15
+            draw_mask.rounded_rectangle(
+                [(0, 0), (total_height, total_height)], 
+                radius=corner_radius, 
+                fill=255
+            )
             
-            # Apply mask for perfect circle with smooth edges
-            circular_avatar = Image.new('RGBA', (avatar_size, avatar_size), (0, 0, 0, 0))
-            circular_avatar.paste(avatar, (0, 0))
-            circular_avatar.putalpha(mask)
-            
-            # Simple clean avatar - no glow effects
-            avatar = circular_avatar
+            # Apply mask for rounded corners
+            rounded_avatar = Image.new('RGBA', (total_height, total_height), (0, 0, 0, 0))
+            rounded_avatar.paste(avatar, (0, 0))
+            rounded_avatar.putalpha(mask)
+            avatar = rounded_avatar
             
         except Exception as e:
             print(f"Avatar processing error: {e}")
-            # Simple fallback avatar
-            avatar = Image.new('RGBA', (avatar_size, avatar_size), (100, 100, 100, 255))
+            # Fallback avatar
+            avatar = Image.new('RGBA', (total_height, total_height), (100, 100, 100, 255))
             draw_avatar = ImageDraw.Draw(avatar)
-            # Simple circle
-            draw_avatar.ellipse((2, 2, avatar_size-2, avatar_size-2), fill=(150, 150, 150))
-            draw_avatar.ellipse((2, 2, avatar_size-2, avatar_size-2), outline=(200, 200, 200), width=2)
+            corner_radius = 15
+            draw_avatar.rounded_rectangle(
+                [(2, 2), (total_height-2, total_height-2)], 
+                radius=corner_radius,
+                fill=(150, 150, 150),
+                outline=(200, 200, 200),
+                width=2
+            )
         
-        # Load fonts - prioritize simple, clean fonts like Make It a Quote
-        try:
-            # Use system fonts that handle text properly - no special emoji fonts
-            username_font = ImageFont.truetype("arial.ttf", username_font_size)
-            handle_font = ImageFont.truetype("arial.ttf", handle_font_size)
-            content_font = ImageFont.truetype("arial.ttf", content_font_size)
-            print("📝 Using Arial font for clean text rendering")
-        except:
-            try:
-                # Fallback to Calibri
-                username_font = ImageFont.truetype("calibri.ttf", username_font_size)
-                handle_font = ImageFont.truetype("calibri.ttf", handle_font_size)
-                content_font = ImageFont.truetype("calibri.ttf", content_font_size)
-                print("� Using Calibri font")
-            except:
-                try:
-                    # Fallback to Segoe UI (without emoji)
-                    username_font = ImageFont.truetype("segoeui.ttf", username_font_size)
-                    handle_font = ImageFont.truetype("segoeui.ttf", handle_font_size)
-                    content_font = ImageFont.truetype("segoeui.ttf", content_font_size)
-                    print("� Using Segoe UI font")
-                except:
-                    # Final fallback
-                    username_font = ImageFont.load_default()
-                    handle_font = ImageFont.load_default()
-                    content_font = ImageFont.load_default()
-                    print("⚠️ Using default font")
-        
-        # Better text wrapping calculation with Unicode support
-        max_text_width = width - avatar_size - (padding * 3)
-        
-        # Create a temporary draw object for text measurement
-        temp_img = Image.new('RGB', (100, 100), (0, 0, 0))
-        temp_draw = ImageDraw.Draw(temp_img)
-        
-        # Use a more conservative character estimation for better wrapping
-        test_text = "M" * 10  # Use a wide character for testing
-        try:
-            test_width = temp_draw.textlength(test_text, font=content_font)
-            chars_per_line = max(15, int((max_text_width * 10) / test_width))
-        except:
-            # Fallback calculation
-            chars_per_line = max(15, max_text_width // (content_font_size // 2))
-        
-        # Ensure we don't break words too aggressively
-        wrapped_text = textwrap.fill(content, width=chars_per_line, break_long_words=False, break_on_hyphens=False)
-        text_lines = wrapped_text.split('\n')
-        line_height = content_font_size + 10  # More generous line spacing
-        text_height = len(text_lines) * line_height
-        
-        # Calculate height more like Make It a Quote
-        min_height = avatar_size + (padding * 2)
-        text_section_height = username_font_size + handle_font_size + text_height + 60
-        total_height = max(min_height, text_section_height + padding)
-        
-        # Position variables for clean layout
-        avatar_x = padding
-        avatar_y = padding
-        
-        # Create simple clean image like Make It a Quote
+        # Create the main image
         img = Image.new('RGB', (width, total_height), bg_color)
+        
+        # Place avatar first (so gradient goes over it)
+        img.paste(avatar, (0, 0), avatar)
+        
+        # Create and apply gradient overlay - IMPORTANT: This creates the nice fade effect
+        gradient = Image.new('RGBA', (width, total_height), (0, 0, 0, 0))
+        gradient_draw = ImageDraw.Draw(gradient)
+        
+        # Create horizontal gradient starting from avatar edge
+        gradient_start = total_height // 4  # Start gradient 1/4 into the avatar
+        for x in range(gradient_start, width):
+            progress = (x - gradient_start) / (width - gradient_start)
+            # Make gradient more pronounced
+            alpha = min(255, int(255 * (progress ** 0.7) * 2))  # Exponential curve for better fade
+            gradient_draw.line([(x, 0), (x, total_height)], fill=(0, 0, 0, alpha))
+        
+        # Apply gradient overlay
+        img = Image.alpha_composite(img.convert('RGBA'), gradient).convert('RGB')
         draw = ImageDraw.Draw(img)
         
-        # Position avatar with premium styling
-        img.paste(avatar, (avatar_x, avatar_y), avatar)
+        # Position text
+        text_start_x = total_height + padding
+        content_y = padding
         
-        # Position text with clean, simple spacing
-        text_start_x = avatar_x + avatar_size + 20  # Simple spacing
-        username_y = avatar_y
-        handle_y = username_y + username_font_size + 5
-        content_y = handle_y + handle_font_size + 15
-        
-        # Draw username with clean styling (no embedded_color)
-        # Add shadow for depth
-        draw.text((text_start_x + 1, username_y + 1), username, fill=shadow_color, font=username_font)
-        draw.text((text_start_x, username_y), username, fill=username_color, font=username_font)
-        
-        # Draw handle with clean appearance
-        draw.text((text_start_x, handle_y), handle, fill=handle_color, font=handle_font)
-        
-        # Draw content with clean text rendering
+        # Draw content with shadow for readability
         y_offset = content_y
         for line in text_lines:
-            # Add shadow for readability
-            draw.text((text_start_x + 1, y_offset + 1), line, fill=shadow_color, font=content_font)
+            # Add shadow for depth
+            draw.text((text_start_x + 2, y_offset + 2), line, fill=shadow_color, font=content_font)
             draw.text((text_start_x, y_offset), line, fill=text_color, font=content_font)
             y_offset += line_height
         
-        # Simple clean border like Make It a Quote
-        draw.rectangle([(0, 0), (width-1, total_height-1)], outline=border_color, width=1)
+        # Position username and handle below content
+        username_y = y_offset + 20
+        handle_y = username_y + username_font_size + 5
+        
+        # Draw username with shadow
+        draw.text((text_start_x + 2, username_y + 2), username, fill=shadow_color, font=username_font)
+        draw.text((text_start_x, username_y), username, fill=username_color, font=username_font)
+        
+        # Draw handle
+        draw.text((text_start_x, handle_y), handle, fill=handle_color, font=handle_font)
         
         # Convert to bytes
         img_bytes = io.BytesIO()
