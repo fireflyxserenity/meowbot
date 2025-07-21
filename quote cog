@@ -252,58 +252,38 @@ class QuoteCog(commands.Cog):
             await interaction.followup.send(embed=embed, ephemeral=True)
 
     async def create_quote_image(self, message):
-        """Create a beautiful quote image from a message with proper Unicode and gradient support."""
+        """Create a beautiful quote image with enhanced emoji and username processing."""
         
         # Get user info
         author = message.author
-        username = author.display_name
+        username = author.display_name if hasattr(author, 'display_name') else author.name
         handle = f"@{author.name}"
         
-        # Get message content - process Discord emojis
-        raw_content = message.content.strip() if message.content else ""
-        
-        # Process Discord custom emojis
-        emoji_pattern = r'<(a?):([^:]+):(\d+)>'
-        def replace_emoji(match):
-            is_animated = match.group(1) == 'a'
-            emoji_name = match.group(2)
-            print(f"🎭 Found Discord emoji: {emoji_name} (animated: {is_animated})")
-            return f":{emoji_name}:"
-        
-        raw_content = re.sub(emoji_pattern, replace_emoji, raw_content)
-        
-        # Clean username with better Unicode handling
-        if username:
-            # Keep most Unicode characters but remove problematic ones
-            username = re.sub(r'[\u0000-\u001F\u007F-\u009F\u200B-\u200D\u2060-\u206F\uFEFF]', '', username)
-            username = username.replace('�', '').strip()
-            
-            if not username or len(username.strip()) < 1:
-                username = author.name
-                username = re.sub(r'[\u0000-\u001F\u007F-\u009F\u200B-\u200D\u2060-\u206F\uFEFF]', '', username)
-                username = username.replace('�', '').strip()
-        else:
-            username = author.name
-        
-        # Handle empty content
-        if not raw_content:
+        # Get content and clean up - handle custom emojis
+        content = message.content  # Use raw content 
+        if not content:
             if message.attachments:
-                raw_content = "*(Image or attachment)*"
+                content = "*(Image or attachment)*"
             elif message.embeds:
-                raw_content = "*(Embed content)*"
+                content = "*(Embed content)*"
             else:
-                raw_content = "*(No text content)*"
+                content = "*(No text content)*"
         
-        # Limit content length
-        if len(raw_content) > 280:
-            raw_content = raw_content[:277] + "..."
+        # Convert Discord custom emojis to readable format
+        # Pattern: <:emoji_name:emoji_id> or <a:emoji_name:emoji_id> (animated)
+        import re
+        def replace_custom_emoji(match):
+            emoji_name = match.group(2)  # Get the emoji name
+            return f":{emoji_name}:"  # Convert to readable format
         
-        content = raw_content
+        # Replace custom emojis with their names
+        content = re.sub(r'<a?:([^:]+):(\d+)>', replace_custom_emoji, content)
         
-        # Clean encoding issues
+        # Enhanced encoding handling
         try:
-            content = content.encode('utf-8', errors='ignore').decode('utf-8')
-        except:
+            content = content.encode('utf-8', errors='replace').decode('utf-8')
+            username = username.encode('utf-8', errors='replace').decode('utf-8')
+        except Exception:
             pass
         
         # Simplified sizing like Make It a Quote
@@ -318,33 +298,30 @@ class QuoteCog(commands.Cog):
         text_color = (255, 255, 255)
         username_color = (255, 255, 255)
         handle_color = (150, 150, 150)
-        shadow_color = (30, 30, 30)  # Slightly gray shadow instead of pure black
+        shadow_color = (30, 30, 30)
         
-        # Load fonts with better Unicode support
+        # Host-friendly font loading (no bundled fonts)
         def load_fonts():
-            """Load the best available fonts for Unicode support."""
-            font_attempts = [
-                ("C:/Windows/Fonts/segoeui.ttf", "Segoe UI (system path)"),
-                ("segoeui.ttf", "Segoe UI"),
-                ("C:/Windows/Fonts/arial.ttf", "Arial (system path)"),
-                ("arial.ttf", "Arial"),
-                ("C:/Windows/Fonts/calibri.ttf", "Calibri (system path)"),
-                ("calibri.ttf", "Calibri"),
-                ("C:/Windows/Fonts/tahoma.ttf", "Tahoma (system path)"),
-                ("tahoma.ttf", "Tahoma"),
+            """Load fonts safely without bundled font files."""
+            # Try system fonts only - no absolute paths
+            font_candidates = [
+                "segoeui.ttf",      # Windows systems
+                "arial.ttf",        # Common fallback
+                "DejaVuSans.ttf"    # Linux fallback
             ]
             
-            for font_path, font_name in font_attempts:
+            for font_name in font_candidates:
                 try:
-                    username_font = ImageFont.truetype(font_path, username_font_size)
-                    handle_font = ImageFont.truetype(font_path, handle_font_size)
-                    content_font = ImageFont.truetype(font_path, content_font_size)
-                    print(f"📝 Successfully loaded {font_name}")
+                    username_font = ImageFont.truetype(font_name, username_font_size)
+                    handle_font = ImageFont.truetype(font_name, handle_font_size)
+                    content_font = ImageFont.truetype(font_name, content_font_size)
+                    
+                    print(f"✅ Successfully loaded {font_name}")
                     return username_font, handle_font, content_font
-                except:
+                except Exception:
                     continue
             
-            print("⚠️ Using default font - Unicode characters may not display properly")
+            print("⚠️ Using PIL default font")
             return ImageFont.load_default(), ImageFont.load_default(), ImageFont.load_default()
         
         username_font, handle_font, content_font = load_fonts()
@@ -353,8 +330,8 @@ class QuoteCog(commands.Cog):
         temp_img = Image.new('RGB', (100, 100), (0, 0, 0))
         temp_draw = ImageDraw.Draw(temp_img)
         
-        # Calculate max text width (width minus avatar space and padding)
-        max_text_width = width - 200 - padding  # 200px for avatar area + padding
+        # Calculate max text width
+        max_text_width = width - 200 - padding
         
         # Use actual text measurement for better wrapping
         test_text = "M" * 10
@@ -419,16 +396,15 @@ class QuoteCog(commands.Cog):
         # Place avatar first (so gradient goes over it)
         img.paste(avatar, (0, 0), avatar)
         
-        # Create and apply gradient overlay - IMPORTANT: This creates the nice fade effect
+        # Create and apply gradient overlay
         gradient = Image.new('RGBA', (width, total_height), (0, 0, 0, 0))
         gradient_draw = ImageDraw.Draw(gradient)
         
         # Create horizontal gradient starting from avatar edge
-        gradient_start = total_height // 4  # Start gradient 1/4 into the avatar
+        gradient_start = total_height // 4
         for x in range(gradient_start, width):
             progress = (x - gradient_start) / (width - gradient_start)
-            # Make gradient more pronounced
-            alpha = min(255, int(255 * (progress ** 0.7) * 2))  # Exponential curve for better fade
+            alpha = min(255, int(255 * (progress ** 0.7) * 2))
             gradient_draw.line([(x, 0), (x, total_height)], fill=(0, 0, 0, alpha))
         
         # Apply gradient overlay
@@ -439,21 +415,32 @@ class QuoteCog(commands.Cog):
         text_start_x = total_height + padding
         content_y = padding
         
-        # Draw content with shadow for readability
+        # Draw content
         y_offset = content_y
         for line in text_lines:
-            # Add shadow for depth
-            draw.text((text_start_x + 2, y_offset + 2), line, fill=shadow_color, font=content_font)
-            draw.text((text_start_x, y_offset), line, fill=text_color, font=content_font)
+            try:
+                draw.text((text_start_x + 2, y_offset + 2), line, fill=shadow_color, font=content_font)
+                draw.text((text_start_x, y_offset), line, fill=text_color, font=content_font)
+            except Exception as e:
+                # Fallback for problematic Unicode characters
+                safe_line = line.encode('ascii', errors='replace').decode('ascii')
+                draw.text((text_start_x + 2, y_offset + 2), safe_line, fill=shadow_color, font=content_font)
+                draw.text((text_start_x, y_offset), safe_line, fill=text_color, font=content_font)
             y_offset += line_height
         
         # Position username and handle below content
         username_y = y_offset + 20
         handle_y = username_y + username_font_size + 5
         
-        # Draw username with shadow
-        draw.text((text_start_x + 2, username_y + 2), username, fill=shadow_color, font=username_font)
-        draw.text((text_start_x, username_y), username, fill=username_color, font=username_font)
+        # Draw username with shadow and Unicode support
+        try:
+            draw.text((text_start_x + 2, username_y + 2), username, fill=shadow_color, font=username_font)
+            draw.text((text_start_x, username_y), username, fill=username_color, font=username_font)
+        except Exception as e:
+            # Fallback for problematic Unicode in username
+            safe_username = username.encode('ascii', errors='replace').decode('ascii')
+            draw.text((text_start_x + 2, username_y + 2), safe_username, fill=shadow_color, font=username_font)
+            draw.text((text_start_x, username_y), safe_username, fill=username_color, font=username_font)
         
         # Draw handle
         draw.text((text_start_x, handle_y), handle, fill=handle_color, font=handle_font)
